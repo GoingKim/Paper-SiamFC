@@ -1,0 +1,81 @@
+TrackerSiamFC 클래스에서 트래킹은 비디오 시퀀스를 보내서 첫번째 프레임의 그라운드 트루트 값을 생성하고
+모델에 보내서 다음 프레임의 타겟의 위치를 예측함.
+
+1. def track 함수는 box들의 좌표와 현재 모델이 처리하고 있는 이미지 프레임의 인덱스를 return하는 함수인듯
+   첫번째 이미지 프레임이 처리되면 다음 이미지 프레임이 처리되도록 update 함수가 재귀형식으로 들어가있다.
+
+2. exampler z와 image x의 임베딩한 값을 cross corelation한 17by17by1 피처맵을 272by 272까지 키운다.
+   (정확성을 위해서 논문에 써있음)
+
+3. a cosine window is added to the score map to penalize large displays
+
+4. context is the semantic information of the boundary.
+
+5. 코드에서 사용하는 response_size는 upscale한 272 by 272 크기를 말한다.
+
+6. 난 context를 그냥 margin이라 생각했는데 그게 아니고 새로운 사이즈의 크기이다.
+   정방형 모양의 region을 추출하기 위해 가로 세로를 더한후 0.5로 나눈 값으로 면적을 그대로 유지하는 방법.
+   (가로,세로 1인 box의 context도 가로세로가 1이다.)
+
+7. examper안에도 박스가 있다. 일단 target box의 w,h값만 주어지만 그때 exampler가 생성된다.루트(w+2p, h+2p) 센터는 박스와 동일한듯
+
+8. 그러니까 box, exampler z, serch image x는 센터는 갖고 크기만 다르게 공유하는(면적이 일정비율로 늘어나는) area가 된다. (box가 주어지만 그 파라미터 값을 바탕으로 z,x를 추출)
+
+9. ops에서는 위에서 얻은 파라미터 기반으로 사진을 크롭한후 빈 자리에는 패딩을 해서 정방형의 이미지를 얻는다.
+   그 이미지를 update는 함수에서 백본에 집어 넣어 임베딩 값을 구한다.
+
+10. 단 스케일이 3개이기 때문에 3가지 스케일의 맞추어 즉 3개의 크기로 크롭을 실시한 후 
+    exampler는 127, search image는 255로 각각 리사이즈 해준뒤 백본에 집어 넣는 것이다.
+
+10-1.In particular, we can find that the side length of search images before resize is about 4 times that of target UZ, which also confirms the paper's: we only search for the object within a region of approximate four times its previous size
+(박스보다 약 4배 큰 영역에서만 searching을 시도-> 여듯기서도 논문 쓸거리가 나올)
+
+11. 그렇게 얻는 피처 벡터의 크기는 [1, 256, 6, 6] [3, 256, 22, 22]이 되고 
+     크로스하면 [3, 1, 17, 17]이 된다.
+
+12. bicubic으로 272 272 3의 크기로 위의 피처맵을 업샘플링해준다.
+    그리고 스케일링에 대한 패널티값을 곱한다. (이값은 scale_penalty': 0.9745 어떻게 나온건지??)
+    코드 설명에 이해에 따라자면 각각의 스케일은 다른크기인데 리사이즈하는 과정에서 shrink나 enlarge가
+    이루어졌기 때문에 이에 대한 패널티값이 필요하다고 주장한다.
+
+13. 새로운 272 피처맵에서 peak점, 그러니까 max값이 있는 위치를 알아낸다.
+    max value localization. why? 가장 높은 값이 있는 곳을 타겟의 위치라고 특정한다.
+    (이를 위해서 먼저 channel 값이 맥스인 곳을 찾고 노말라이즈하고 hanning window를 준다.)
+    (최소값을 빼고 합으로 나누고 해닝윈도우를 주고 최종적으론 넘파이 unravel_index코드로 찾는다.)
+
+-> target의 위치가 x,y좌표로 나와야 하는것은 아닌지...?
+
+14. 다음 질문은 이 찾은 피크 점이 원본이미지의 어디에 해당하느냐가 질문이다. 그래서 displacement 계산필요
+
+15. 우린 모든 이미지의 처리과정을 target centered하게 맞추었고 peak포인트는 객체의 중심점으로 예측되므로
+    peak point와 response center의 displacement를 구하면 된다.
+    (self.upscale_sz = 272, response -> instance patch -> image이렇게 dis를 찾은 후 센터에 더한다.)
+
+16. target의 위치가 x,y 이며 displacement도 델타x, 델타y로 2개의 값이 주어질ㄷ
+
+
+17. disp_in_instance = disp_in_response * self.cfg.total_stride / self.cfg.response_up
+                                                 (8)                         (16)   
+
+-> response up은 17바이17이미지를 272로 키울때 사용했던 스케일크기이다. 
+   일단 response up 16으로 나누면 17 by 17이미지의 크기로 볼 수 있고,
+   17 바이 17에서 한칸은 272 272에서 16칸으로 볼 수 있는데 
+   
+   여기서는 17by17로 복원한게 아니라 255 by 255 즉 CNN에 들어가기전 것 까지 복원한 것 이기때문에
+   총 stride값을 곱해주는 것 같다. 뭔가 다른 cross correlation기법이 들어간듯 총 8이면 일반적인 칸수 안맞음
+   head에서 fast cross correlation을 쓰는데 이와 연ㄷ관이 있을듯하
+
+
+18. disp_in_image = disp_in_instance * self.x_sz * self.scale_factors[scale_id] / self.cfg.instance_sz
+                                  (search image size) *   (우리가 주었던 스케일크기) / (255)
+
+다
+19. image는 스케일업&리사이즈하기 전 search image의 크기 (앞의 공식)
+    instance patch는 cnn에 넣기 전 serach image의 크기 (255 by 255)
+    response (272 by 272)
+
+20. disp 구한것을 바탕으로 센터를 수정해주고 scale을 새로계산해서 타겟과 x,z이미지 사이즈를 수정해준다.
+because the paper has a sentence: update the scale by linear interpolation with a factor of 0.35 to provide stamping, but it seems that the parameters are not quite right, the linear interpolation can be seen in the following blue figure, because the updated scale is still close to 1, so the bbox area will not change greatly
+
+21. scale factor와 기하학을 이용해서 3개의 값을 그냥 조화평균적으로 계산하는듯 
+논문 숫자가 맞지 않는것같아 다른 숫자를 사용
